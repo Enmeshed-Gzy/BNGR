@@ -1,18 +1,18 @@
 function result=case2(mode,workers,outDir,seed)
+totalClock=tic;
 if nargin<1 || isempty(mode), mode='auto'; end
 if nargin<2 || isempty(workers), workers=8; end
 if nargin<3, outDir=''; end
 if nargin<4 || isempty(seed), seed=2026; end
-mode=validatestring(mode,{'auto','cpu','gpu','mex','split'});
+mode=validatestring(mode,{'auto','cpu','gpu','mex'});
 validateattributes(workers,{'numeric'},{'scalar','integer','nonnegative'});
 validateattributes(seed,{'numeric'},{'scalar','real','finite','integer','>=',0,'<=',2^32-1});
 seed=double(seed);
 root=fileparts(mfilename('fullpath'));
 featureNames=arrayfun(@(j)sprintf('X%d',j),1:8,'UniformOutput',false);
 dataNames=[{'SourceRow'},featureNames,{'Response'}];
-trainFile=fullfile(root,'train.csv'); testFile=fullfile(root,'test.csv');
-trainTable=readtable(trainFile,'VariableNamingRule','preserve');
-testTable=readtable(testFile,'VariableNamingRule','preserve');
+trainTable=readtable(fullfile(root,'train.csv'),'VariableNamingRule','preserve');
+testTable=readtable(fullfile(root,'test.csv'),'VariableNamingRule','preserve');
 assert(isequal(trainTable.Properties.VariableNames,dataNames) ...
     &&isequal(testTable.Properties.VariableNames,dataNames), ...
     'BNGR:CSVSchema','Expected SourceRow, input columns, and Response only.');
@@ -33,57 +33,31 @@ clear rngGuard
 labels=groupFold(groups);
 orderStream=RandStream('mt19937ar','Seed',mod(seed+1,2^32));
 globalOrder=randperm(orderStream,n)';
-orders=cell(1,5); trainingOrder=table;
+orders=cell(1,5);
 for f=1:5
-    ids=globalOrder(labels(globalOrder)~=f);
-    held=find(labels==f);
+    ids=globalOrder(labels(globalOrder)~=f); held=find(labels==f);
     assert(numel(ids)>=5&&~isempty(held)&&isempty(intersect(ids,held)), ...
         'BNGR:Partition','Invalid training/test fold.');
     assert(std(A(ids,end),0)>0&&sum((A(held,end)-mean(A(held,end))).^2)>0, ...
-        'BNGR:Response','A fold has constant responses; do not select a new seed based on its score.');
+        'BNGR:Response','A fold has constant responses.');
     orders{f}=ids;
-    trainingOrder=[trainingOrder;table(repmat(f,numel(ids),1),(1:numel(ids))',sourceRows(ids), ...
-        'VariableNames',{'Fold','Rank','SourceRow'})];
 end
 assert(all(accumarray(groups,labels,[],@min)==accumarray(groups,labels,[],@max)), ...
     'BNGR:Duplicates','Identical records must remain in one fold.');
-foldAssignment=table(sourceRows,groups,labels,'VariableNames',{'SourceRow','RecordGroup','Fold'});
-P=struct('Case',2,'Rows',n,'Features',8,'Folds',5,'Seed',seed, ...
-    'TrainingOrderSeed',mod(seed+1,2^32),'DistinctRecords',groupCount, ...
-    'PartitionUnit','Identical full records grouped together', ...
-    'ValidationScope','Random five-fold cross-validation on the pooled CSV data', ...
-    'IndependentHoldout',false,'ResponseStratification',false, ...
-    'ScoreSelectedPartition',false,'ScoreSelectedTrainingOrder',false, ...
-    'TrainingOrderRule','One independently seeded random order filtered by training membership', ...
-    'TrainSHA256',file_hash(trainFile),'TestSHA256',file_hash(testFile), ...
-    'MethodSHA256',file_hash([mfilename('fullpath'),'.m']), ...
-    'DriverSHA256',file_hash([mfilename('fullpath'),'.m']), ...
-    'RequestedMode',mode,'RequestedWorkers',workers,'InputTransform','none', ...
-    'EvidenceRule','Unchanged scalar-Hessian Laplace with the existing checked quadrature fallback');
-if 2==2, P.InputTransform='Natural logarithm of age (X8)'; end
-if isempty(outDir)
-    outDir=fullfile(fileparts(root),['case2_random5_',char(datetime('now','Format','yyyyMMdd_HHmmss_SSS'))]);
-end
-assert(exist(outDir,'file')==0&&exist(outDir,'dir')==0, ...
-    'BNGR:OutputExists','Choose a new output directory.');
-[ok,msg]=mkdir(outDir); assert(ok,'BNGR:Output','%s',msg);
-[~,info]=fileattrib(outDir); outDir=info.Name;
-write_precision_table(foldAssignment,fullfile(outDir,'fold_assignment.csv'));
-write_precision_table(trainingOrder,fullfile(outDir,'training_order.csv'));
-write_json(fullfile(outDir,'protocol.json'),P);
-if strcmp(mode,'split')
-    result=struct('Completed',true,'SplitOnly',true,'Protocol',P,'FoldAssignment',foldAssignment, ...
-        'TrainingOrder',trainingOrder,'OutputDirectory',outDir);
-    disp(groupsummary(foldAssignment,'Fold'));
-    return
-end
 B=A;
 if 2==2
     assert(all(A(:,8)>0),'BNGR:Age','Age must be positive.');
     B(:,8)=log(A(:,8));
 end
+if isempty(outDir)
+    outDir=fullfile(fileparts(root),['case2_results_',char(datetime('now','Format','yyyyMMdd_HHmmss_SSS'))]);
+end
+assert(exist(outDir,'file')==0&&exist(outDir,'dir')==0, ...
+    'BNGR:OutputExists','Choose a new output directory.');
+[ok,msg]=mkdir(outDir); assert(ok,'BNGR:Output','%s',msg);
+[~,info]=fileattrib(outDir); outDir=info.Name;
 C=bngr_method('options');
-[pathCleanup,mexBuild]=setup_optional_mex();
+setupLog=evalc('[pathCleanup,mexBuild]=setup_optional_mex();');
 if exist('bngr_grid_mex','file')==3
     assert(mexBuild.Available&&isfield(mexBuild,'BinaryPath') ...
         &&strcmp(canonical_path(which('bngr_grid_mex')),canonical_path(mexBuild.BinaryPath)), ...
@@ -96,73 +70,94 @@ if license('test','Distrib_Computing_Toolbox')&&exist('gcp','file')~=0
     end
 end
 opts=struct('mode',mode,'workers',workers,'useParallel',true); ids=orders{1};
-hardware=prepare_hardware(B(ids,1:end-1),B(ids,end),opts);
-write_json(fullfile(outDir,'hardware.json'),hardware);
-models=cell(1,5); fitSeconds=zeros(5,1);
-fprintf('Case %d | seed %u | %d samples | random five-fold CV\n',2,seed,n);
+hardwareLog=evalc('hardware=prepare_hardware(B(ids,1:end-1),B(ids,end),opts);');
+foldMetrics=zeros(5,5);
 for f=1:5
-    ids=orders{f}; clock=tic;
+    ids=orders{f}; held=find(labels==f);
     model=bngr_method('fit',B(ids,1:end-1),B(ids,end),C,hardware,@bngr_grid);
     validate_model(model,numel(ids),8,C);
-    fitSeconds(f)=toc(clock); models{f}=model;
-    fprintf('Fold %d/5: selected %s from %d subsets, %.2f s\n', ...
-        f,mat2str(model.selectedFeatures),model.candidateCount,fitSeconds(f));
+    prediction=bngr_method('predict',model,B(held,1:end-1));
+    row=prediction_metrics(A(held,end),prediction);
+    foldMetrics(f,:)=row{1,{'R2','MAE','MAPE','RMSE','RAE'}};
 end
-metrics=table; selected=table; candidates=table; summary=table; oof=nan(n,1);
-for f=1:5
-    model=models{f};
-    chosen=table(2,f,model.selected.mask,string(mat2str(model.selectedFeatures)), ...
-        model.selected.varphi1,model.selected.varphi2,model.selected.logEvidence, ...
-        model.candidateCount,fitSeconds(f),'VariableNames', ...
-        {'Case','Fold','Mask','Features','Phi1','Phi2','LogEvidence','CandidateCount','FitSeconds'});
-    selected=[selected;chosen];
-    allModels=model.allModels; allModels.Case=repmat(2,height(allModels),1);
-    allModels.Fold=repmat(f,height(allModels),1); candidates=[candidates;allModels];
-    for part=1:2
-        if part==1, ids=orders{f}; label="Training"; else, ids=find(labels==f); label="TestFold"; end
-        prediction=bngr_method('predict',model,B(ids,1:end-1)); actual=A(ids,end);
-        row=prediction_metrics(actual,prediction);
-        row.Case=2; row.Fold=f; row.Partition=label; row.SampleCount=numel(ids);
-        row.SSE=sum((actual-prediction).^2); row.SST=sum((actual-mean(actual)).^2);
-        assert(abs(row.R2-(1-row.SSE/row.SST))<1e-12,'BNGR:Metric','R2 disagreement.');
-        metrics=[metrics;row];
-        if part==2, oof(ids)=prediction; end
-    end
-    fprintf('\nFold %d training/test metrics:\n',f);
-    disp(metrics(metrics.Fold==f,{'Partition','SampleCount','R2','RMSE','MAE','MAPE','RAE'}));
+assert(all(isfinite(foldMetrics),'all'),'BNGR:Metrics','Nonfinite fold metrics.');
+averages=mean(foldMetrics,1);
+meanMetrics=table("BNGR",averages(1),averages(2),averages(3),averages(4),averages(5), ...
+    'VariableNames',{'Method','R2','MAE','MAPE_percent','RMSE','RAE'});
+finalModel=bngr_method('fit',B(globalOrder,1:end-1),B(globalOrder,end),C,hardware,@bngr_grid);
+validate_model(finalModel,n,8,C);
+topTen=top_ten_models(finalModel);
+write_precision_table(topTen,fullfile(outDir,'top_ten_candidate_models.csv'));
+write_precision_table(meanMetrics,fullfile(outDir,'fivefold_mean_metrics.csv'));
+fprintf('\nTop ten candidate models ranked by model evidence\n');
+fprintf('%-26s %12s %12s %16s %16s %16s\n', ...
+    'Model','phi_1*','phi_2*','Likelihood','Model evidence','Model probability');
+for k=1:height(topTen)
+    fprintf('%-26s %12s %12s %16s %16s %16s\n', ...
+        char(topTen.Model(k)),parameter_text(topTen.Phi1(k)),parameter_text(topTen.Phi2(k)), ...
+        char(topTen.Likelihood(k)),char(topTen.ModelEvidence(k)),char(topTen.ModelProbability(k)));
 end
-assert(all(isfinite(oof)),'BNGR:OOF','Every sample requires one held-out prediction.');
-metricNames={'R2','RMSE','MAE','MAPE','RAE'};
-for label=["Training","TestFold"]
-    rows=metrics(metrics.Partition==label,:);
-    item=table(2,label,5,'VariableNames',{'Case','Partition','FoldCount'});
-    for j=1:numel(metricNames)
-        item.([metricNames{j},'Mean'])=mean(rows.(metricNames{j}));
-        item.([metricNames{j},'SD'])=std(rows.(metricNames{j}),0);
-    end
-    summary=[summary;item];
-end
-pooled=prediction_metrics(A(:,end),oof); pooled.Case=2; pooled.SampleCount=n;
-pooled.SSE=sum((A(:,end)-oof).^2); pooled.SST=sum((A(:,end)-mean(A(:,end))).^2);
-oofTable=table(sourceRows,labels,A(:,end),oof,'VariableNames',{'SourceRow','Fold','Actual','Prediction'});
-write_precision_table(metrics,fullfile(outDir,'fold_metrics.csv'));
-write_precision_table(summary,fullfile(outDir,'summary_mean_sd.csv'));
-write_precision_table(pooled,fullfile(outDir,'pooled_oof_metrics.csv'));
-write_precision_table(selected,fullfile(outDir,'selected_models.csv'));
-write_precision_table(candidates,fullfile(outDir,'candidate_models.csv'));
-write_precision_table(oofTable,fullfile(outDir,'oof_predictions.csv'));
-result=struct('Completed',true,'SplitOnly',false,'Case',2,'OutputDirectory',outDir, ...
-    'Protocol',P,'FoldAssignment',foldAssignment,'TrainingOrder',trainingOrder, ...
-    'FoldMetrics',metrics,'Summary',summary,'PooledMetrics',pooled,'SelectedModels',selected, ...
-    'Hardware',hardware,'MEXBuild',mexBuild,'AllModels',{cellfun(@(m)m.allModels,models,'UniformOutput',false)}, ...
-    'OOFPrediction',oof,'TrainingPredictionIncludesSelf',true);
-write_json(fullfile(outDir,'complete.json'),struct('Completed',true,'Case',2,'Folds',5,'Seed',seed));
-disp(summary); fprintf('Saved: %s\n',outDir);
+units='MPa';
+if 2==1, units='kN'; end
+fprintf('\nFive-fold mean validation metrics\n');
+fprintf('%-10s %10s %14s %14s %14s %12s\n', ...
+    'Method','R^2',['MAE (',units,')'],'MAPE (%)',['RMSE (',units,')'],'RAE');
+fprintf('%-10s %10.3f %14.3f %14.3f %14.3f %12.3f\n','BNGR',averages);
+totalSeconds=toc(totalClock);
+runtime=table(totalSeconds,totalSeconds/60, ...
+    'VariableNames',{'TotalSeconds','TotalMinutes'});
+write_precision_table(runtime,fullfile(outDir,'runtime.csv'));
+fprintf('\nTotal runtime: %.3f seconds (%.3f minutes)\n',totalSeconds,totalSeconds/60);
+result=struct('TopTenModels',topTen,'FiveFoldMeanMetrics',meanMetrics, ...
+    'Runtime',runtime,'OutputDirectory',outDir, ...
+    'ValidationScope','Five-fold validation on pooled train.csv and test.csv', ...
+    'EvidenceFitScope','Final refit on all pooled records in the independently seeded training order', ...
+    'DensityScale','Standardized response; conditional on the first response', ...
+    'RuntimeScope','Function entry through fitting, two table exports and table display; excludes recording this timing');
 end
 
-function write_json(file,value)
-fid=fopen(file,'w','n','UTF-8'); assert(fid>0); guard=onCleanup(@() fclose(fid));
-fprintf(fid,'%s\n',jsonencode(value,'PrettyPrint',true));
+function text=parameter_text(value)
+if abs(value)>0&&(abs(value)<1e-4||abs(value)>=1e4)
+    text=sprintf('%.3E',value);
+else
+    text=sprintf('%.4f',value);
+end
+end
+
+function T=top_ten_models(model)
+allModels=sortrows(model.allModels,'logEvidence','descend');
+maximum=max(allModels.logEvidence);
+logNormalizer=maximum+log(sum(exp(allModels.logEvidence-maximum)));
+T=table;
+for k=1:min(10,height(allModels))
+    selected=find(bitget(allModels.mask(k),1:model.m));
+    D=zeros(model.N);
+    for j=selected
+        D=D+((model.X(:,j)-model.X(:,j)')./model.xStd(j)).^2;
+    end
+    S=prepare_pairs(D,model.eta);
+    phi2=allModels.varphi2(k);
+    assert(phi2>0&&isfinite(phi2),'BNGR:Variance','Invalid variance parameter.');
+    logLikelihood=-S.n/2*(log(2*pi)+log(phi2)) ...
+        +sum(S.logLambda)/2-0.5*exp(allModels.logQ(k)-log(phi2));
+    assert(isfinite(logLikelihood),'BNGR:Likelihood','Nonfinite log likelihood.');
+    name="("+strjoin(string(selected),",")+")";
+    row=table(name,allModels.varphi1(k),phi2, ...
+        scientific_from_log(logLikelihood),scientific_from_log(allModels.logEvidence(k)), ...
+        scientific_from_log(allModels.logEvidence(k)-logNormalizer), ...
+        'VariableNames',{'Model','Phi1','Phi2','Likelihood','ModelEvidence','ModelProbability'});
+    T=[T;row];
+end
+end
+
+function text=scientific_from_log(value)
+assert(isscalar(value)&&isfinite(value),'BNGR:LogValue','Expected a finite logarithm.');
+power=floor(value/log(10));
+mantissa=exp(value-power*log(10));
+if round(mantissa,2)>=10
+    mantissa=mantissa/10; power=power+1;
+end
+text=string(sprintf('%.2fE%+03.0f',mantissa,power));
 end
 
 function yes=all_finite(values)
